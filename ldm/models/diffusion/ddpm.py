@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -38,6 +38,7 @@ import os
 import cv2
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from ldm.models.diffusion.op import SuperResolutionOperator
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -230,6 +231,7 @@ class DDPM(pl.LightningModule):
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
 
+        self.op = SuperResolutionOperator([1,3,512,512], scale_factor=8)
 
     def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
@@ -1933,6 +1935,7 @@ class LatentDiffusionSRTextWT(DDPM):
             usm_sharpener = USMSharp().cuda()  # do usm sharpening
 
         im_gt = batch['gt'].cuda()
+        '''
         if self.use_usm:
             im_gt = usm_sharpener(im_gt)
         im_gt = im_gt.to(memory_format=torch.contiguous_format).float()
@@ -2059,7 +2062,7 @@ class LatentDiffusionSRTextWT(DDPM):
 
         # clamp and round
         im_lq = torch.clamp(out, 0, 1.0)
-
+        print(im_gt.shape, im_lq.shape)
         # random crop
         gt_size = self.configs.degradation['gt_size']
         im_gt, im_lq = paired_random_crop(im_gt, im_lq, gt_size, self.configs.sf)
@@ -2075,6 +2078,10 @@ class LatentDiffusionSRTextWT(DDPM):
 
         if random.random() < self.configs.degradation['no_degradation_prob'] or torch.isnan(self.lq).any():
             self.lq = self.gt
+        '''
+        # simple bicubic
+        self.gt = im_gt
+        self.lq = self.op(self.gt, keep_shape=True)
 
         # training pair pool
         if not val and not self.random_size:
@@ -2516,7 +2523,12 @@ class LatentDiffusionSRTextWT(DDPM):
             e_t_uncond, e_t = self.apply_model(x_in, t_in_, c_in, struct_cond, return_ids=False).chunk(2)
             model_out = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
             return_codebook_ids=False
-
+        save_dict = {
+            "x_in": x,
+            "t_in": t_in,
+            "model_out": model_out,
+        }
+        # torch.save(save_dict, "./out/{}.pt".format(t_in.item()))
         if score_corrector is not None:
             assert self.parameterization == "eps"
             model_out = score_corrector.modify_score(self, model_out, x, t, c, **corrector_kwargs)

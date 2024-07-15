@@ -19,6 +19,8 @@ from pytorch_lightning import seed_everything
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+from ldm.models.diffusion.op import SuperResolutionOperator
+
 import math
 import copy
 from scripts.wavelet_color_fix import wavelet_reconstruction, adaptive_instance_normalization
@@ -79,7 +81,32 @@ def chunk(it, size):
 	it = iter(it)
 	return iter(lambda: tuple(islice(it, size)), ())
 
-def load_model_from_config(config, ckpt, verbose=False):
+def load_model_from_config_vae(config, ckpt, verbose=False):
+	print(f"Loading model from {ckpt}")
+	pl_sd = torch.load(ckpt, map_location="cpu")
+	if "global_step" in pl_sd:
+		print(f"Global Step: {pl_sd['global_step']}")
+	sd = pl_sd["state_dict"]
+	sdvae = {}
+	model = instantiate_from_config(config.model)
+	for key in sd.keys():
+		if 'first_stage_model.' in key:
+			sdvae[key.replace('first_stage_model.', '')] = sd[key]
+
+	m, u = model.load_state_dict(sdvae, strict=False)
+	if len(m) > 0 and verbose:
+		print("missing keys:")
+		print(m)
+	if len(u) > 0 and verbose:
+		print("unexpected keys:")
+		print(u)
+
+	model.cuda()
+	model.eval()
+	return model
+
+
+def load_model_from_config_unet(config, ckpt, verbose=False):
 	print(f"Loading model from {ckpt}")
 	pl_sd = torch.load(ckpt, map_location="cpu")
 	if "global_step" in pl_sd:
@@ -90,6 +117,8 @@ def load_model_from_config(config, ckpt, verbose=False):
 	if len(m) > 0 and verbose:
 		print("missing keys:")
 		print(m)
+	else:
+		print("all key loaded")
 	if len(u) > 0 and verbose:
 		print("unexpected keys:")
 		print(u)
@@ -148,7 +177,7 @@ def main():
 	parser.add_argument(
 		"--n_samples",
 		type=int,
-		default=2,
+		default=10,
 		help="how many samples to produce for each given prompt. A.k.a batch size",
 	)
 	parser.add_argument(
@@ -191,7 +220,7 @@ def main():
 	parser.add_argument(
 		"--dec_w",
 		type=float,
-		default=0.5,
+		default=0.0,
 		help="weight for combining VQGAN and Diffusion",
 	)
 	parser.add_argument(
@@ -214,7 +243,7 @@ def main():
 	print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
 	vqgan_config = OmegaConf.load("configs/autoencoder/autoencoder_kl_64x64x4_resi.yaml")
-	vq_model = load_model_from_config(vqgan_config, opt.vqgan_ckpt)
+	vq_model = load_model_from_config_vae(vqgan_config, opt.vqgan_ckpt, verbose=True)
 	vq_model = vq_model.to(device)
 	vq_model.decoder.fusion_w = opt.dec_w
 
@@ -226,7 +255,7 @@ def main():
 	])
 
 	config = OmegaConf.load(f"{opt.config}")
-	model = load_model_from_config(config, f"{opt.ckpt}")
+	model = load_model_from_config_unet(config, f"{opt.ckpt}")
 	model = model.to(device)
 
 	os.makedirs(opt.outdir, exist_ok=True)
@@ -234,7 +263,7 @@ def main():
 
 	batch_size = opt.n_samples
 
-	img_list_ori = os.listdir(opt.init_img)
+	img_list_ori = sorted(os.listdir(opt.init_img))
 	img_list = copy.deepcopy(img_list_ori)
 	init_image_list = []
 	for item in img_list_ori:
@@ -301,48 +330,53 @@ def main():
 
 	precision_scope = autocast if opt.precision == "autocast" else nullcontext
 	niqe_list = []
+
+	op = SuperResolutionOperator([1,3,512,512], scale_factor=8).cuda()
 	with torch.no_grad():
 		with precision_scope("cuda"):
 			with model.ema_scope():
-				tic = time.time()
-				count = 0
-				for n in trange(niters, desc="Sampling"):
-					init_image = init_image_list[n]
-					init_latent_generator, enc_fea_lq = vq_model.encode(init_image)
-					init_latent = model.get_first_stage_encoding(init_latent_generator)
-					text_init = ['']*init_image.size(0)
-					semantic_c = model.cond_stage_model(text_init)
+				for nn in range(25):
+					tic = time.time()
+					count = 0
+					for n in trange(niters, desc="Sampling"):
+						init_image = init_image_list[n]
+						init_image = op(init_image, keep_shape=True)
+						init_latent_generator, enc_fea_lq = vq_model.encode(init_image)
+						init_latent = model.get_first_stage_encoding(init_latent_generator)
+						text_init = ['']*init_image.size(0)
+						semantic_c = model.cond_stage_model(text_init)
 
-					noise = torch.randn_like(init_latent)
-					# If you would like to start from the intermediate steps, you can add noise to LR to the specific steps.
-					t = repeat(torch.tensor([999]), '1 -> b', b=init_image.size(0))
-					t = t.to(device).long()
-					x_T = model.q_sample_respace(x_start=init_latent, t=t, sqrt_alphas_cumprod=sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod, noise=noise)
-					x_T = None
+						noise = torch.randn_like(init_latent)
+						# If you would like to start from the intermediate steps, you can add noise to LR to the specific steps.
+						t = repeat(torch.tensor([999]), '1 -> b', b=init_image.size(0))
+						t = t.to(device).long()
+						x_T = model.q_sample_respace(x_start=init_latent, t=t, sqrt_alphas_cumprod=sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod, noise=noise)
+						x_T = None
 
-					samples, _ = model.sample(cond=semantic_c, struct_cond=init_latent, batch_size=init_image.size(0), timesteps=opt.ddpm_steps, time_replace=opt.ddpm_steps, x_T=x_T, return_intermediates=True)
-					x_samples = vq_model.decode(samples * 1. / model.scale_factor, enc_fea_lq)
-					if opt.colorfix_type == 'adain':
-						x_samples = adaptive_instance_normalization(x_samples, init_image)
-					elif opt.colorfix_type == 'wavelet':
-						x_samples = wavelet_reconstruction(x_samples, init_image)
-					x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-					# count += 1
-					# if count==5:
-					# 	tic = time.time()
-					# if count >= 15:
-					# 	print('>>>>>>>>>>>>>>>>>>>>>>>>')
-					# 	print(time.time()-tic)
-					# 	print(s)
+						samples, _ = model.sample(cond=semantic_c, struct_cond=init_latent, batch_size=init_image.size(0), timesteps=opt.ddpm_steps, time_replace=opt.ddpm_steps, x_T=x_T, return_intermediates=True)
+						x_samples = vq_model.decode(samples * 1. / model.scale_factor, enc_fea_lq)
+						if opt.colorfix_type == 'adain':
+							x_samples = adaptive_instance_normalization(x_samples, init_image)
+						elif opt.colorfix_type == 'wavelet':
+							x_samples = wavelet_reconstruction(x_samples, init_image)
+						x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+						# count += 1
+						# if count==5:
+						# 	tic = time.time()
+						# if count >= 15:
+						# 	print('>>>>>>>>>>>>>>>>>>>>>>>>')
+						# 	print(time.time()-tic)
+						# 	print(s)
 
-					for i in range(init_image.size(0)):
-						img_name = img_list.pop(0)
-						basename = os.path.splitext(os.path.basename(img_name))[0]
-						x_sample = 255. * rearrange(x_samples[i].cpu().numpy(), 'c h w -> h w c')
-						Image.fromarray(x_sample.astype(np.uint8)).save(
-							os.path.join(outpath, basename+'.png'))
+						for i in range(init_image.size(0)):
+							# img_name = img_list.pop(0)
+							img_name = img_list[0]
+							basename = os.path.splitext(os.path.basename(img_name))[0]
+							x_sample = 255. * rearrange(x_samples[i].cpu().numpy(), 'c h w -> h w c')
+							Image.fromarray(x_sample.astype(np.uint8)).save(
+								os.path.join(outpath, basename+'_{}'.format(nn)+'.png'))
 
-				toc = time.time()
+					toc = time.time()
 
 	print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
 		  f" \nEnjoy.")

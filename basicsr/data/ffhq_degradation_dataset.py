@@ -57,8 +57,15 @@ class FFHQDegradationDataset(data.Dataset):
             with open(osp.join(self.gt_folder, 'meta_info.txt')) as fin:
                 self.paths = [line.split('.')[0] for line in fin]
         else:
-            # disk backend: scan file list from a folder
-            self.paths = self.paths = sorted([str(x) for x in Path(self.gt_folder).glob('*.'+opt['image_type'])])
+            if self.gt_folder == 'txt':
+                self.paths = []
+                f = open(self.gt_folder, 'r')
+                lines = f.readlines()            
+                for line in lines:
+                    self.paths.append(line.strip())
+            else:
+                # disk backend: scan file list from a folder
+                self.paths = sorted([str(x) for x in Path(self.gt_folder).glob('*.'+opt['image_type'])])
 
         # degradation configurations
         self.blur_kernel_size = opt['blur_kernel_size']

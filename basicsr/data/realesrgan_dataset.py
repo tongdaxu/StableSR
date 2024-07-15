@@ -47,6 +47,12 @@ class RealESRGANDataset(data.Dataset):
 
         # support multiple type of data: file path and meta data, remove support of lmdb
         self.paths = []
+        if 'txt' in opt['gt_path'][0]:
+            f = open(opt['gt_path'][0], 'r')
+            lines = f.readlines()            
+            for line in lines:
+                self.paths.append(line.strip())
+
         if 'meta_info' in opt:
             with open(self.opt['meta_info']) as fin:
                     paths = [line.strip().split(' ')[0] for line in fin]
